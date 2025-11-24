@@ -53,6 +53,9 @@ import { IHistoryService } from '../../../../../services/history/common/history.
 import { TerminalCommandArtifactCollector } from './terminalCommandArtifactCollector.js';
 import { isNumber, isString } from '../../../../../../base/common/types.js';
 import { ChatConfiguration } from '../../../../chat/common/constants.js';
+import { IFileService } from '../../../../../../platform/files/common/files.js';
+import { URI } from '../../../../../../base/common/uri.js';
+import { VSBuffer } from '../../../../../../base/common/buffer.js';
 
 // #region Tool data
 
@@ -243,6 +246,7 @@ export interface IRunInTerminalInputParams {
 	command: string;
 	explanation: string;
 	isBackground: boolean;
+	workspaceFolder?: string;
 }
 
 /**
@@ -291,6 +295,7 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 		@ITerminalLogService private readonly _logService: ITerminalLogService,
 		@ITerminalService private readonly _terminalService: ITerminalService,
 		@IWorkspaceContextService private readonly _workspaceContextService: IWorkspaceContextService,
+		@IFileService private readonly _fileService: IFileService,
 	) {
 		super();
 
@@ -318,7 +323,16 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 					this._storageService.remove(TerminalToolConfirmationStorageKeys.TerminalAutoApproveWarningAccepted, StorageScope.APPLICATION);
 				}
 			}
+			// check for sandbox setting changes
+			if (!e || e.affectsConfiguration(TerminalChatAgentToolsSettingId.TerminalSandbox)) {
+				const sandboxSetting = this._configurationService.getValue<ISandboxTerminalSettings>(TerminalChatAgentToolsSettingId.TerminalSandbox);
+				if (sandboxSetting?.enabled === true) {
+					// create a config file inside .vscode folder.
+					this._createConfigFileForSandboxing();
+				}
+			}
 		}));
+
 
 		// Restore terminal associations from storage
 		this._restoreTerminalAssociations();
@@ -490,10 +504,9 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 				}]
 			};
 		}
-
 		const args = invocation.parameters as IRunInTerminalInputParams;
 		this._logService.debug(`RunInTerminalTool: Invoking with options ${JSON.stringify(args)}`);
-		let toolResultMessage: string | undefined;
+		let toolResultMessage: string | IMarkdownString | undefined;
 
 		const chatSessionId = invocation.context?.sessionId ?? 'no-chat-session';
 		const command = toolSpecificData.commandLine.userEdited ?? toolSpecificData.commandLine.toolEdited ?? toolSpecificData.commandLine.original;
@@ -675,9 +688,13 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 				}
 				terminalResult = resultArr.join('\n\n');
 
-				//if sandboxed and there is error, show the command uri to sandbox settings
+				//if sandboxed and there is error, display a hint message
 				if (exitCode !== 0 && this._isSandBoxedTerminal()) {
-					toolResultMessage = 'Failure may be due to terminal sandboxing. Update the [terminal sandbox settings](command:workbench.action.openSettings?%5B%22chat.tools.terminal.terminalSandbox%22%5D) to run in non sandboxed mode.';
+					const mdTrustSettings = {
+						isTrusted: true
+					};
+					// ToDo: check if code-oss uri works in vscode
+					toolResultMessage = new MarkdownString(`$(info) Failure may be due to terminal sandboxing. Configure the [sandbox settings](code-oss://settings/chat.tools.terminal.terminalSandbox) to run in non sandboxed mode.`, mdTrustSettings);
 				}
 
 			} catch (e) {
@@ -784,6 +801,41 @@ export class RunInTerminalTool extends Disposable implements IToolImpl {
 			terminals?.push(toolTerminal);
 			this._sessionTerminalAssociations.set(chatSessionId, terminals!);
 		}
+	}
+
+	private async _createConfigFileForSandboxing(): Promise<void> {
+
+		const workSpaceFolder = this._workspaceContextService.getWorkspace().folders[0]?.uri.fsPath;
+
+		if (!workSpaceFolder) {
+			return;
+		}
+		const sandboxSettingsUri = URI.file(workSpaceFolder).with({
+			path: `${workSpaceFolder}/.vscode/sandbox-settings.json`
+		});
+		const settings = this._configurationService.getValue<ISandboxTerminalSettings>(TerminalChatAgentToolsSettingId.TerminalSandbox);
+
+		const sandboxSettings = {
+			network: {
+				allowedDomains: settings.Network?.allowedHosts || [],
+				deniedDomains: settings.Network?.deniedHosts || []
+			},
+			filesystem: {
+				denyRead: settings.Filesystem?.denyRead || ['.env'],
+				allowWrite: settings.Filesystem?.allowWrite || ['.'],
+				denyWrite: settings.Filesystem?.denyWrite || ['.env']
+			}
+		};
+		await this._fileService.createFile(sandboxSettingsUri, VSBuffer.fromString(JSON.stringify(sandboxSettings, null, '\t')), { overwrite: true });
+
+		// if (exists) {
+		// 	//update existing file if needed
+		// 	this._fileService.writeFile(sandboxSettingsUri, VSBuffer.fromString(JSON.stringify(sandboxSettings, null, '\t')));
+		// } else {
+		// 	//create new file
+		// 	await this._fileService.createFolder(URI.file(`${workSpaceFolder}/.vscode`));
+		// 	this._fileService.writeFile(sandboxSettingsUri, VSBuffer.fromString(JSON.stringify(sandboxSettings, null, '\t')));
+		// }
 	}
 
 	// #region Terminal init
